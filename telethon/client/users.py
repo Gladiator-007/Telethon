@@ -14,6 +14,121 @@ _NOT_A_REQUEST = lambda: TypeError('You can only invoke requests, not types!')
 if typing.TYPE_CHECKING:
     from .telegramclient import TelegramClient
 
+def _fmt_flood(delay, request, *, early=False, td=datetime.timedelta):
+    return (
+        'Sleeping%s for %ds (%s) on %s flood wait',
+        ' early' if early else '',
+        delay,
+        td(seconds=delay),
+        request.__class__.__name__
+    )
+
+
+class UserMethods:
+    async def __call__(self: 'TelegramClient', request, ordered=False, flood_sleep_threshold=None):
+        return await self._call(self._sender, request, ordered=ordered)
+
+    async def _call(self: 'TelegramClient', sender, request, ordered=False, flood_sleep_threshold=None):
+        if flood_sleep_threshold is None:
+            flood_sleep_threshold = self.flood_sleep_threshold
+        requests = (request if utils.is_list_like(request) else (request,))
+        for r in requests:
+            if not isinstance(r, TLRequest):
+                raise _NOT_A_REQUEST()
+            await r.resolve(self, utils)
+
+            # Avoid making the request if it's already in a flood wait
+            if r.CONSTRUCTOR_ID in self._flood_waited_requests:
+                due = self._flood_waited_requests[r.CONSTRUCTOR_ID]
+                diff = round(due - time.time())
+                if diff <= 3:  # Flood waits below 3 seconds are "ignored"
+                    self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
+                elif diff <= flood_sleep_threshold:
+                    self._log[__name__].info(*_fmt_flood(diff, r, early=True))
+                    await asyncio.sleep(diff)
+                    self._flood_waited_requests.pop(r.CONSTRUCTOR_ID, None)
+                else:
+                    raise errors.FloodWaitError(request=r, capture=diff)
+
+            if self._no_updates:
+                r = functions.InvokeWithoutUpdatesRequest(r)
+
+        request_index = 0
+        last_error = None
+        self._last_request = time.time()
+
+        for attempt in retry_range(self._request_retries):
+            try:
+                future = sender.send(request, ordered=ordered)
+                if isinstance(future, list):
+                    results = []
+                    exceptions = []
+                    for f in future:
+                        try:
+                            result = await f
+                        except RPCError as e:
+                            exceptions.append(e)
+                            results.append(None)
+                            continue
+                        self.session.process_entities(result)
+                        self._entity_cache.add(result)
+                        exceptions.append(None)
+                        results.append(result)
+                        request_index += 1
+                    if any(x is not None for x in exceptions):
+                        raise MultiError(exceptions, results, requests)
+                    else:
+                        return results
+                else:
+                    result = await future
+                    self.session.process_entities(result)
+                    self._entity_cache.add(result)
+                    return result
+            except (errors.ServerError, errors.RpcCallFailError,
+                    errors.RpcMcgetFailError, errors.InterdcCallErrorError,
+                    errors.InterdcCallRichErrorError) as e:
+                last_error = e
+                self._log[__name__].warning(
+                    'Telegram is having internal issues %s: %s',
+                    e.__class__.__name__, e)
+
+                await asyncio.sleep(2)
+            except (errors.FloodWaitError, errors.SlowModeWaitError, errors.FloodTestPhoneWaitError) as e:
+                last_error = e
+                if utils.is_list_like(request):
+                    request = request[request_index]
+
+                # SLOW_MODE_WAIT is chat-specific, not request-specific
+                if not isinstance(e, errors.SlowModeWaitError):
+                    self._flood_waited_requests\
+                        [request.CONSTRUCTOR_ID] = time.time() + e.seconds
+
+                # In test servers, FLOOD_WAIT_0 has been observed, and sleeping for
+                # such a short amount will cause retries very fast leading to issues.
+                if e.seconds == 0:
+                    e.seconds = 1
+
+                if e.seconds <= self.flood_sleep_threshold:
+                    self._log[__name__].info(*_fmt_flood(e.seconds, request))
+                    await asyncio.sleep(e.seconds)
+                else:
+                    raise
+            except (errors.PhoneMigrateError, errors.NetworkMigrateError,
+                    errors.UserMigrateError) as e:
+                last_error = e
+                self._log[__name__].info('Phone migrated to %d', e.new_dc)
+                should_raise = isinstance(e, (
+                    errors.PhoneMigrateError, errors.NetworkMigrateError
+                ))
+                if should_raise and await self.is_user_authorized():
+                    raise
+                await self._switch_dc(e.new_dc)
+
+        if self._raise_last_call_error and last_error is not None:
+            raise last_error
+        raise ValueError('Request was unsuccessful {} time(s)'
+                         .format(attempt))
+
     # region Public methods
 
     async def get_me(self: 'TelegramClient', input_peer: bool = False) \
